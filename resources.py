@@ -4,23 +4,16 @@
 사전정리 시트(dict)를 입력으로 받아, 경기데이터드림 4종 데이터에서
 이용자에게 적합한 기관을 추천한다.
 
+[변경 — 이번 차수]
+  - extract_region() 이 sheet_data["거주지역"](app.py 의 intake 가 주입)을
+    우선 사용하도록 find_resources() 의 region 추출부를 수정.
+    기존에는 basic_info 만 읽어, intake 에서 받은 용인시 등이 매칭되지
+    않고 광역 폴백으로 빠지는 버그가 있었다.
+
 매칭 흐름:
   ① 호소 분류 (classify_concern)
-     - 시트의 main_concern + treatment_history + desired_help 텍스트를
-       LLM 으로 분류해 자원 범주의 1순위·2순위를 정한다.
-     - 4개 범주: mhwc(정신건강복지센터) / spc(자살예방센터) /
-                 arc(중독관리통합지원센터) / pr(정신재활시설)
-     - LLM 실패 시 키워드 규칙으로 폴백한다.
-
-  ② 시·군 추출 (extract_region)
-     - 시트의 basic_info 에서 거주 시·군을 정규화해 뽑는다.
-       예: "수원시 영통구" / "수원시" / "영통구" → "수원시" 로 통일
-
+  ② 시·군 추출 (extract_region) — '거주지역' 키 우선, 없으면 basic_info
   ③ 매칭 (find_resources)
-     - 범주별로 같은 시·군의 기관을 우선 안내한다.
-     - 같은 시·군에 없으면 광역(경기도) 자원을 폴백으로 제시한다.
-     - 1순위 범주만 안내하지 않고, 2순위 범주도 함께 안내한다
-       (한 사람이 여러 어려움을 겹쳐 갖는 경우가 흔하므로).
 
 설계 원칙:
   - LLM 이 범주를 '단정'하지 않고 '후보 1·2순위'로 둔다.
@@ -68,7 +61,7 @@ _DISTRICT_TO_CITY = {
 
 def extract_region(basic_info_text: str) -> str | None:
     """
-    basic_info 문자열에서 경기도 시·군을 추출해 정규화된 형태로 반환한다.
+    문자열에서 경기도 시·군을 추출해 정규화된 형태로 반환한다.
     찾지 못하면 None.
 
     예시:
@@ -258,10 +251,10 @@ def find_resources(client, sheet_data: dict,
     ----------
     client : OpenAI
     sheet_data : dict
-        summarize_to_sheet() 의 결과
+        summarize_to_sheet() 의 결과. app.py 의 intake 가 '거주지역' 키를
+        주입할 수 있다.
     resources : list
         자원 레코드 리스트. None 이면 SAMPLE_RESOURCES 사용.
-        운영 환경에서는 load_resources_from_files() 로 갱신된 데이터를 전달.
     model : str
         분류용 모델
     max_per_category : int
@@ -279,8 +272,11 @@ def find_resources(client, sheet_data: dict,
     primary = cls["primary"]
     secondary = cls["secondary"]
 
-    # 2) 시·군 추출
-    region = extract_region(sheet_data.get("basic_info", ""))
+    # 2) 시·군 추출 — app.py intake 가 주입한 '거주지역' 키를 우선 사용,
+    #    없으면 시트의 basic_info 로 폴백.
+    region = extract_region(
+        sheet_data.get("거주지역") or sheet_data.get("basic_info", "")
+    )
 
     # 3) 매칭
     primary_list, used_fb_p = _match_category(resources, primary, region,
@@ -308,9 +304,6 @@ def _match_category(resources: list, category: str,
     """
     같은 시·군의 해당 범주 기관을 최대 k 개 반환.
     같은 시·군에 없으면 광역(시·군이 광역 거점인 자원) 폴백.
-
-    같은 시·군에 여러 기관이 있을 때는 일반 성인 대상 센터를 우선한다.
-    (노인·아동청소년 등 특수 대상 센터는 후순위)
     """
     same_region = [r for r in resources
                    if r["category"] == category
@@ -334,16 +327,8 @@ def _match_category(resources: list, category: str,
 
 
 def _priority_key(resource: dict) -> tuple:
-    """
-    같은 시·군 내 기관 정렬용 우선순위 키.
-    낮은 값이 앞에 온다.
-
-    일반 성인 대상이 1순위, 특수 대상 센터(노인·아동청소년·소아청소년)는
-    뒤로 보낸다. 이용자 대다수가 성인이고, 호소 내용에서 특수 대상이
-    명시되지 않은 한 일반 센터를 우선 노출하는 것이 적절하다.
-    """
+    """같은 시·군 내 기관 정렬용 우선순위 키. 낮은 값이 앞에 온다."""
     name = resource.get("name", "")
-    # 0순위: 일반(분화 없거나 '성인' 명시) / 1순위: 그 외(노인·아동청소년 등)
     if any(kw in name for kw in ("노인", "아동청소년", "소아청소년", "아동")):
         tier = 2
     elif "성인" in name:
@@ -362,7 +347,7 @@ def _region_matches(resource_region: str, query_region: str) -> bool:
         for city in _GG_CITIES:
             if city in s:
                 return city
-        return s.strip()
+        return (s or "").strip()
     return root_city(resource_region) == root_city(query_region)
 
 
@@ -396,6 +381,5 @@ def load_resources_from_files(data_dir: str = "data") -> list:
                 r["category"] = cat
                 out.append(r)
         except Exception:
-            # 손상 파일은 건너뜀
             continue
     return out
