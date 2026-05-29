@@ -264,8 +264,10 @@ def render_interview():
     # ===== 안전 통과 → 인터뷰 한 턴 진행 =====
     try:
         with st.spinner("듣고 있어요…"):
+            # intake 에서 받은 지역을 전달 → 인터뷰 LLM 이 거주지를 다시 묻지 않음
             turn = run_interview_turn(client, ss.user_type, ss.history,
-                                      model=CHAT_MODEL)
+                                      model=CHAT_MODEL,
+                                      known_region=ss.get("region"))
     except Exception as e:
         st.error(
             "이야기를 처리하는 중에 문제가 생겼어요. "
@@ -358,7 +360,8 @@ def render_summarize():
         try:
             with st.spinner("이야기해 주신 내용을 시트로 정리하고 있어요…"):
                 ss.sheet_data = summarize_to_sheet(
-                    client, ss.user_type, ss.history, model=CHAT_MODEL)
+                    client, ss.user_type, ss.history, model=CHAT_MODEL,
+                    known_region=ss.get("region"))
         except Exception as e:
             st.error(
                 "시트로 정리하는 중에 문제가 생겼어요. 잠시 후 다시 시도해 주세요.\n\n"
@@ -368,10 +371,16 @@ def render_summarize():
                 st.rerun()
             return
 
-        # intake 에서 받은 지역·연령대를 시트에 주입
-        # → find_resources() 의 지역 매칭과 사전정리 시트에 함께 반영된다.
+        # intake 에서 받은 지역·연령대를 시트에 반영
+        # → find_resources() 의 지역 매칭과 사전정리 시트에 함께 쓰인다.
         if ss.get("region"):
             ss.sheet_data["거주지역"] = ss.region
+            # basic_info 에 지역이 비어 있으면 보정 (매칭은 거주지역 키로도 동작)
+            bi = (ss.sheet_data.get("basic_info") or "").strip()
+            if ss.region not in bi:
+                ss.sheet_data["basic_info"] = (
+                    f"{bi} {ss.region}".strip() if bi else ss.region
+                )
         if ss.get("age_group"):
             ss.sheet_data["연령대"] = ss.age_group
 
