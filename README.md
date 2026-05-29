@@ -1,3 +1,4 @@
+<img width="1055" height="1491" alt="경기마음온길" src="https://github.com/user-attachments/assets/0242e28f-eb3a-4bcd-a5e4-77f5a50b45a0" />
 # 경기 마음온길 (Gyeonggi Maeum-on-Gil)
 
 > **정신건강 자원 안내·사전정리 AI 챗봇**
