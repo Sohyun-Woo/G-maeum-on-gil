@@ -1,4 +1,4 @@
-<img width="1055" height="1491" alt="경기마음온길" src="https://github.com/user-attachments/assets/0242e28f-eb3a-4bcd-a5e4-77f5a50b45a0" />
+<img width="1054" height="1492" alt="경기마음온길" src="https://github.com/user-attachments/assets/19520aec-9020-4881-a4c1-77a294420eba" />
 *해당 설명은 Chat GPT를 이용하여 작성하였습니다.
 
 # 경기 마음온길 (Gyeonggi Maeum-on-Gil)
