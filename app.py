@@ -1,24 +1,26 @@
 """
 경기 마음온길 (Gyeonggi Maeum-on-Gil) — Streamlit 통합 (app.py)
 
-[변경 요약]
-  - 위기/음주 감지 시 '하드 종료'하던 render_blocked() 를
-    안전 자원 안내 + "계속 이야기할지 / 지금은 그만할지" 선택형으로 교체.
-  - "계속 이야기할게요" → 인터뷰(interview) 단계로 복귀, 대화 지속.
-  - "지금은 그만할게요" → ended 단계로 부드럽게 마무리(번호 재안내).
-  - 안전 자원 번호를 2026년 기준으로 명시(109 / 1577-0199 / 119).
-    ※ prompts.py 의 CRISIS_CONTACT_LINE 도 109 기준인지 확인 권장.
+[변경 요약 — 이번 차수]
+  - select 와 interview 사이에 'intake' 단계 추가.
+      └ 거주 지역(경기도 시·군)을 받고, 그 목적("주변 정신건강 자원을
+        찾기 위해서만 사용")을 명시. 데이터 최소화 — 이름·식별정보는
+        받지 않으며, 연령대만 선택(선택사항)으로 둔다.
+  - 받은 region/age_group 을 summarize 후 sheet_data 에 주입해
+    find_resources() 의 지역 매칭과 사전정리 시트에 함께 반영.
 
-전제: safety.py 는 A안(키워드 단독) 버전이 배포되어 있어야 한다.
-      그래야 "우울해요/도와줄 사람 없어요" 같은 정서 호소가 통과한다.
+[이전 차수 유지]
+  - 위기/음주 감지 시 '하드 종료' 대신 안전 자원 안내 + "계속/그만" 선택.
+  - safety.py 는 A안(키워드 단독) 버전이 배포되어 있어야 한다.
 
 핵심 흐름:
   ① 이용자 유형 선택 (당사자 / 가족)
-  ② 사용자 메시지 입력
-  ③ [안전 우선] detect_safety() — 위기·음주 감지가 인터뷰보다 먼저
-       └ 차단 시: blocked 단계로 전환(인터뷰 호출 안 함)
-  ④ run_interview_turn() — 다음 질문 or 완료 신호
-  ⑤ 완료 시: summarize_to_sheet() → build_sheet_docx() → 다운로드 버튼
+  ② [신규] intake — 거주 지역(+연령대) 입력
+  ③ 사용자 메시지 입력
+  ④ [안전 우선] detect_safety() — 위기·음주 감지가 인터뷰보다 먼저
+       └ 차단 시: blocked 단계(인터뷰 호출 안 함)
+  ⑤ run_interview_turn() — 다음 질문 or 완료 신호
+  ⑥ 완료 시: summarize_to_sheet() → find_resources() → 다운로드
 
 실행: streamlit run app.py
 필요: pip install streamlit openai python-docx
@@ -44,12 +46,27 @@ CHAT_MODEL = "gpt-4o-mini"
 SAFETY_MODEL = "gpt-4o-mini"
 MAX_TURNS = 30  # API 비용 보호
 
-# 안전 자원 번호 (2026년 기준) — blocked/ended 화면에서 공통 사용
+# 안전 자원 번호 (2026년 기준)
 SAFETY_LINES_MD = (
     "- **자살예방 상담전화 109** — 24시간, 비밀 보장\n"
     "- **정신건강 상담전화 1577-0199**\n"
     "- **긴급한 위급 상황 119**"
 )
+
+# 거주 지역 옵션 — 경기도 31개 시·군 (자원 매칭용)
+GYEONGGI_REGIONS = [
+    "수원시", "고양시", "용인시", "성남시", "부천시", "화성시", "안산시",
+    "남양주시", "안양시", "평택시", "시흥시", "파주시", "의정부시", "김포시",
+    "광주시", "광명시", "군포시", "하남시", "오산시", "양주시", "이천시",
+    "구리시", "안성시", "포천시", "의왕시", "여주시", "동두천시", "과천시",
+    "가평군", "양평군", "연천군",
+]
+REGION_PLACEHOLDER = "— 지역을 선택해 주세요 —"
+REGION_OTHER = "경기도 외 / 잘 모르겠어요"
+
+AGE_GROUPS = [
+    "선택 안 함", "10대", "20대", "30대", "40대", "50대", "60대", "70대 이상",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -58,8 +75,10 @@ SAFETY_LINES_MD = (
 def init_state():
     ss = st.session_state
     ss.setdefault("user_type", None)        # 'self' | 'family'
+    ss.setdefault("region", None)           # 거주 시·군
+    ss.setdefault("age_group", None)        # 연령대 (선택)
     ss.setdefault("history", [])            # 대화 기록 (system 제외)
-    ss.setdefault("phase", "select")        # select | interview | blocked | ended | summarize | done
+    ss.setdefault("phase", "select")        # select | intake | interview | blocked | ended | summarize | done
     ss.setdefault("block_kind", None)       # 'crisis' | 'intoxication'
     ss.setdefault("sheet_data", None)
     ss.setdefault("resource_match", None)
@@ -113,6 +132,8 @@ def render_sidebar():
             st.caption("👤 현재: 당사자 본인 진행 중")
         elif ut == "family":
             st.caption("👪 현재: 가족·보호자 진행 중")
+        if st.session_state.get("region"):
+            st.caption(f"📍 지역: {st.session_state.region}")
         st.caption(f"대화 사용: {st.session_state.turn_count}/{MAX_TURNS}회")
         if st.button("🔄 처음부터 다시"):
             for k in list(st.session_state.keys()):
@@ -140,14 +161,58 @@ def render_select():
         if st.button("🙋 제 마음의 어려움을 정리하고 싶어요\n(당사자 본인)",
                      use_container_width=True):
             st.session_state.user_type = "self"
-            st.session_state.phase = "interview"
+            st.session_state.phase = "intake"
             st.rerun()
     with col2:
         if st.button("👪 가족의 어려움을 도와주고 싶어요\n(가족·보호자)",
                      use_container_width=True):
             st.session_state.user_type = "family"
-            st.session_state.phase = "interview"
+            st.session_state.phase = "intake"
             st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 단계 1b: intake — 거주 지역(+연령대) 입력
+# ---------------------------------------------------------------------------
+def render_intake():
+    ss = st.session_state
+    st.title("거의 다 됐어요")
+    st.write(
+        "혹시 사시는 곳이 어디인가요? "
+        "주변의 정신건강 자원을 찾기 위해서만 사용되며, 따로 저장되지 않습니다."
+    )
+
+    region = st.selectbox(
+        "거주 지역 (시·군)",
+        options=[REGION_PLACEHOLDER] + GYEONGGI_REGIONS + [REGION_OTHER],
+        index=0,
+    )
+
+    age_group = st.selectbox(
+        "연령대 (선택사항) — 연령대별 기관 안내에만 참고됩니다",
+        options=AGE_GROUPS,
+        index=0,
+    )
+
+    st.caption(
+        "이름·연락처 등 개인을 식별할 수 있는 정보는 묻지 않습니다. "
+        "입력하신 내용은 자원 안내와 사전정리 시트 작성에만 쓰입니다."
+    )
+
+    can_start = region != REGION_PLACEHOLDER
+    if st.button("이야기 시작하기", type="primary", disabled=not can_start,
+                 use_container_width=True):
+        if region == REGION_PLACEHOLDER:
+            ss.region = None
+        else:
+            # REGION_OTHER 도 라벨 그대로 보존해 매칭 단계에서 참고
+            ss.region = region
+        ss.age_group = None if age_group == "선택 안 함" else age_group
+        ss.phase = "interview"
+        st.rerun()
+
+    if not can_start:
+        st.caption("지역을 선택하시면 시작 버튼이 활성화됩니다.")
 
 
 # ---------------------------------------------------------------------------
@@ -189,8 +254,6 @@ def render_interview():
     client = get_client()
 
     # ===== 안전 우선: 인터뷰 LLM 호출 '전에' 감지 =====
-    # safety.py 가 A안(키워드 단독)일 때, _CRISIS_KEYWORDS /
-    # _INTOXICATION_KEYWORDS 에 명시된 표현에서만 차단된다.
     safety = detect_safety(client, user_input, model=SAFETY_MODEL)
     if safety.is_blocked:
         ss.phase = "blocked"
@@ -209,9 +272,8 @@ def render_interview():
             "잠시 후 다시 시도해 주시거나, 사이드바에서 API Key 를 확인해 주세요.\n\n"
             f"_세부 사유: {type(e).__name__}_"
         )
-        # 마지막 사용자 메시지는 그대로 두되 카운터 되돌림 — 재시도 가능
         ss.turn_count -= 1
-        ss.history.pop()  # 방금 추가된 사용자 메시지 제거
+        ss.history.pop()
         return
     ss.history.append({"role": "assistant",
                        "content": turn["assistant_message"]})
@@ -225,21 +287,11 @@ def render_interview():
 # 단계 3: 안전 분기 — 종료가 아니라 '선택'을 제공
 # ---------------------------------------------------------------------------
 def render_blocked():
-    """
-    위기/음주 신호가 잡혔을 때의 화면.
-
-    설계 의도: 힘든 이야기를 꺼내던 중 갑자기 잘리고 종료 문구만 뜨는
-    경험은 오히려 위해가 될 수 있다. 따라서
-      (1) 안전 자원(상담전화)을 안내하고,
-      (2) "그래도 대화를 이어갈지 / 지금은 멈출지"를 사용자가 직접
-          선택하도록 한다(자율성 존중).
-    """
     ss = st.session_state
     is_crisis = ss.block_kind == "crisis"
 
     st.title("이야기를 들려주세요")
 
-    # 갑자기 잘린 느낌을 줄이기 위해 지금까지의 대화 맥락을 그대로 보여준다
     for msg in ss.history:
         with st.chat_message("user" if msg["role"] == "user" else "assistant"):
             st.write(msg["content"])
@@ -260,8 +312,6 @@ def render_blocked():
         with col1:
             if st.button("계속 이야기할게요", use_container_width=True,
                          type="primary", key="blocked_continue"):
-                # 방금 사용자가 한 말(차단되어 응답받지 못한 메시지)에
-                # 부드럽게 응답하며 인터뷰로 복귀
                 ss.history.append({
                     "role": "assistant",
                     "content": ("이야기를 이어가 주셔서 고마워요. "
@@ -318,16 +368,21 @@ def render_summarize():
                 st.rerun()
             return
 
+        # intake 에서 받은 지역·연령대를 시트에 주입
+        # → find_resources() 의 지역 매칭과 사전정리 시트에 함께 반영된다.
+        if ss.get("region"):
+            ss.sheet_data["거주지역"] = ss.region
+        if ss.get("age_group"):
+            ss.sheet_data["연령대"] = ss.age_group
+
     if ss.resource_match is None:
         try:
             with st.spinner("가까운 정신건강 기관을 찾고 있어요…"):
-                # 배포 시 갱신된 데이터가 있으면 그것을 쓰고, 없으면 샘플 사용
                 resources = load_resources_from_files("data") or None
                 ss.resource_match = find_resources(
                     client, ss.sheet_data,
                     resources=resources, model=CHAT_MODEL)
         except Exception as e:
-            # 자원 매칭 실패해도 시트는 살아 있으므로 done 으로 진행
             st.warning(
                 f"기관 안내를 가져오지 못했어요({type(e).__name__}). "
                 "사전정리 시트만 먼저 안내해 드릴게요."
@@ -343,7 +398,6 @@ def render_done():
     ss = st.session_state
     st.title("준비가 끝났어요")
 
-    # 5-1) 자원 안내 (방문 '전' 도움)
     if ss.resource_match is not None:
         st.markdown(ss.resource_match.to_user_text())
         st.divider()
@@ -354,14 +408,12 @@ def render_done():
         )
         st.divider()
 
-    # 5-2) 사전정리 시트 다운로드 (방문 '후' 도움)
     st.subheader("📄 사전정리 시트")
     st.write(
         "아래에서 시트를 내려받아, 정신건강 기관에 방문하거나 전화하실 때 "
         "참고 자료로 활용하실 수 있습니다."
     )
 
-    # 미리보기
     with st.expander("시트 내용 미리보기"):
         for key, value in ss.sheet_data.items():
             st.markdown(f"**{key}**: {value or '_(이야기 나누지 않음)_'}")
@@ -393,6 +445,8 @@ def main():
     phase = st.session_state.phase
     if phase == "select":
         render_select()
+    elif phase == "intake":
+        render_intake()
     elif phase == "interview":
         render_interview()
     elif phase == "blocked":
@@ -404,7 +458,6 @@ def main():
     elif phase == "done":
         render_done()
 
-    # 푸터 — 위기 자원 상시 노출
     st.divider()
     st.caption(
         "⚠️ 경기 마음온길은 의료 진단·치료 도구가 아닙니다.  ·  "
