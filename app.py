@@ -1,14 +1,22 @@
 """
-경기 마음온길 (Gyeonggi Maeum-on-Gil) — Streamlit 통합 예시 (app.py)
+경기 마음온길 (Gyeonggi Maeum-on-Gil) — Streamlit 통합 (app.py)
 
-prompts / safety / conversation / sheet_builder 모듈을 조립한 데모.
-사두신 코드 구조에 맞춰 이 흐름을 그대로 이식하면 된다.
+[변경 요약]
+  - 위기/음주 감지 시 '하드 종료'하던 render_blocked() 를
+    안전 자원 안내 + "계속 이야기할지 / 지금은 그만할지" 선택형으로 교체.
+  - "계속 이야기할게요" → 인터뷰(interview) 단계로 복귀, 대화 지속.
+  - "지금은 그만할게요" → ended 단계로 부드럽게 마무리(번호 재안내).
+  - 안전 자원 번호를 2026년 기준으로 명시(109 / 1577-0199 / 119).
+    ※ prompts.py 의 CRISIS_CONTACT_LINE 도 109 기준인지 확인 권장.
+
+전제: safety.py 는 A안(키워드 단독) 버전이 배포되어 있어야 한다.
+      그래야 "우울해요/도와줄 사람 없어요" 같은 정서 호소가 통과한다.
 
 핵심 흐름:
   ① 이용자 유형 선택 (당사자 / 가족)
   ② 사용자 메시지 입력
   ③ [안전 우선] detect_safety() — 위기·음주 감지가 인터뷰보다 먼저
-       └ 차단 시: 안내 메시지 전환, 인터뷰 호출 안 함
+       └ 차단 시: blocked 단계로 전환(인터뷰 호출 안 함)
   ④ run_interview_turn() — 다음 질문 or 완료 신호
   ⑤ 완료 시: summarize_to_sheet() → build_sheet_docx() → 다운로드 버튼
 
@@ -36,6 +44,13 @@ CHAT_MODEL = "gpt-4o-mini"
 SAFETY_MODEL = "gpt-4o-mini"
 MAX_TURNS = 30  # API 비용 보호
 
+# 안전 자원 번호 (2026년 기준) — blocked/ended 화면에서 공통 사용
+SAFETY_LINES_MD = (
+    "- **자살예방 상담전화 109** — 24시간, 비밀 보장\n"
+    "- **정신건강 상담전화 1577-0199**\n"
+    "- **긴급한 위급 상황 119**"
+)
+
 
 # ---------------------------------------------------------------------------
 # 세션 상태 초기화
@@ -44,7 +59,7 @@ def init_state():
     ss = st.session_state
     ss.setdefault("user_type", None)        # 'self' | 'family'
     ss.setdefault("history", [])            # 대화 기록 (system 제외)
-    ss.setdefault("phase", "select")        # select | interview | blocked | done
+    ss.setdefault("phase", "select")        # select | interview | blocked | ended | summarize | done
     ss.setdefault("block_kind", None)       # 'crisis' | 'intoxication'
     ss.setdefault("sheet_data", None)
     ss.setdefault("resource_match", None)
@@ -174,6 +189,8 @@ def render_interview():
     client = get_client()
 
     # ===== 안전 우선: 인터뷰 LLM 호출 '전에' 감지 =====
+    # safety.py 가 A안(키워드 단독)일 때, _CRISIS_KEYWORDS /
+    # _INTOXICATION_KEYWORDS 에 명시된 표현에서만 차단된다.
     safety = detect_safety(client, user_input, model=SAFETY_MODEL)
     if safety.is_blocked:
         ss.phase = "blocked"
@@ -205,18 +222,77 @@ def render_interview():
 
 
 # ---------------------------------------------------------------------------
-# 단계 3: 안전 분기 차단 화면
+# 단계 3: 안전 분기 — 종료가 아니라 '선택'을 제공
 # ---------------------------------------------------------------------------
 def render_blocked():
+    """
+    위기/음주 신호가 잡혔을 때의 화면.
+
+    설계 의도: 힘든 이야기를 꺼내던 중 갑자기 잘리고 종료 문구만 뜨는
+    경험은 오히려 위해가 될 수 있다. 따라서
+      (1) 안전 자원(상담전화)을 안내하고,
+      (2) "그래도 대화를 이어갈지 / 지금은 멈출지"를 사용자가 직접
+          선택하도록 한다(자율성 존중).
+    """
     ss = st.session_state
-    if ss.block_kind == "crisis":
-        st.error("잠깐, 함께 멈추어 볼게요")
-        st.write(CRISIS_REDIRECT_MESSAGE)
-    else:
-        st.warning("오늘은 여기까지 하는 것이 좋겠어요")
-        st.write(INTOXICATION_REDIRECT_MESSAGE)
+    is_crisis = ss.block_kind == "crisis"
+
+    st.title("이야기를 들려주세요")
+
+    # 갑자기 잘린 느낌을 줄이기 위해 지금까지의 대화 맥락을 그대로 보여준다
+    for msg in ss.history:
+        with st.chat_message("user" if msg["role"] == "user" else "assistant"):
+            st.write(msg["content"])
+
+    with st.chat_message("assistant"):
+        if is_crisis:
+            st.warning("잠깐만요. 지금 많이 힘드신 것 같아요.")
+            st.write(CRISIS_REDIRECT_MESSAGE)
+        else:
+            st.warning("지금은 잠시 쉬어가도 좋아요.")
+            st.write(INTOXICATION_REDIRECT_MESSAGE)
+
+        st.markdown(SAFETY_LINES_MD)
+        st.divider()
+        st.write("전화가 어렵다면, 여기서 저와 이야기를 더 이어가도 괜찮습니다.")
+
+        col1, col2 = st.columns(2)
+        with col1:
+            if st.button("계속 이야기할게요", use_container_width=True,
+                         type="primary", key="blocked_continue"):
+                # 방금 사용자가 한 말(차단되어 응답받지 못한 메시지)에
+                # 부드럽게 응답하며 인터뷰로 복귀
+                ss.history.append({
+                    "role": "assistant",
+                    "content": ("이야기를 이어가 주셔서 고마워요. "
+                                "편하게 계속 말씀해 주세요."),
+                })
+                ss.block_kind = None
+                ss.phase = "interview"
+                st.rerun()
+        with col2:
+            if st.button("지금은 그만할게요", use_container_width=True,
+                         key="blocked_stop"):
+                ss.block_kind = None
+                ss.phase = "ended"
+                st.rerun()
+
+
+# ---------------------------------------------------------------------------
+# 단계 3b: 사용자가 직접 멈추기를 선택했을 때의 마무리 화면
+# ---------------------------------------------------------------------------
+def render_ended():
+    st.title("언제든 다시 찾아와 주세요")
+    st.write(
+        "오늘 이야기 나눠 주셔서 고마워요. 마음이 힘들 땐 혼자 견디지 "
+        "않으셔도 됩니다. 아래 번호는 24시간 함께합니다."
+    )
+    st.markdown(SAFETY_LINES_MD)
     st.divider()
-    st.caption("도움 연락처  ·  " + CRISIS_CONTACT_LINE)
+    if st.button("처음으로 돌아가기"):
+        for k in list(st.session_state.keys()):
+            del st.session_state[k]
+        st.rerun()
 
 
 # ---------------------------------------------------------------------------
@@ -321,6 +397,8 @@ def main():
         render_interview()
     elif phase == "blocked":
         render_blocked()
+    elif phase == "ended":
+        render_ended()
     elif phase == "summarize":
         render_summarize()
     elif phase == "done":
